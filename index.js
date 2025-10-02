@@ -29,17 +29,50 @@ var Stats = require('fs').Stats
 var toString = Object.prototype.toString
 
 /**
+ * Cache configuration
+ * @private
+ */
+
+var HASH_CACHE_SIZE = 1000
+var STAT_CACHE_TTL = 5000 // 5 seconds
+var hashCache = new Map()
+var hashCacheKeys = []
+var statCache = new Map()
+
+// Pre-computed empty entity tag
+var EMPTY_TAG = '"0-2jmj7l5rSw0yVb/vlWAYkK/YBwk"'
+var WEAK_EMPTY_TAG = 'W/' + EMPTY_TAG
+
+/**
  * Generate an entity tag.
  *
  * @param {Buffer|string} entity
+ * @param {boolean} [weak]
  * @return {string}
  * @private
  */
 
-function entitytag (entity) {
+function entitytag (entity, weak) {
   if (entity.length === 0) {
     // fast-path empty
-    return '"0-2jmj7l5rSw0yVb/vlWAYkK/YBwk"'
+    return weak ? WEAK_EMPTY_TAG : EMPTY_TAG
+  }
+
+  var isBuffer = Buffer.isBuffer(entity)
+  var len = isBuffer ? entity.length : Buffer.byteLength(entity, 'utf8')
+
+  // Generate cache key using length and first/last bytes for quick uniqueness check
+  var cacheKey
+  if (isBuffer) {
+    cacheKey = len + '-' + entity[0] + '-' + entity[len - 1]
+  } else {
+    cacheKey = len + '-' + entity.charCodeAt(0) + '-' + entity.charCodeAt(len - 1)
+  }
+
+  // Check hash cache
+  var cached = hashCache.get(cacheKey)
+  if (cached && cached.entity === entity) {
+    return weak ? 'W/' + cached.tag : cached.tag
   }
 
   // compute hash of entity
@@ -49,12 +82,17 @@ function entitytag (entity) {
     .digest('base64')
     .substring(0, 27)
 
-  // compute length of entity
-  var len = typeof entity === 'string'
-    ? Buffer.byteLength(entity, 'utf8')
-    : entity.length
+  var tag = '"' + len.toString(16) + '-' + hash + '"'
 
-  return '"' + len.toString(16) + '-' + hash + '"'
+  // Update cache with LRU eviction
+  if (hashCache.size >= HASH_CACHE_SIZE) {
+    var oldestKey = hashCacheKeys.shift()
+    hashCache.delete(oldestKey)
+  }
+  hashCacheKeys.push(cacheKey)
+  hashCache.set(cacheKey, { entity: entity, tag: tag })
+
+  return weak ? 'W/' + tag : tag
 }
 
 /**
@@ -85,12 +123,10 @@ function etag (entity, options) {
 
   // generate entity tag
   var tag = isStats
-    ? stattag(entity)
-    : entitytag(entity)
+    ? stattag(entity, weak)
+    : entitytag(entity, weak)
 
-  return weak
-    ? 'W/' + tag
-    : tag
+  return tag
 }
 
 /**
@@ -119,13 +155,51 @@ function isstats (obj) {
  * Generate a tag for a stat.
  *
  * @param {object} stat
+ * @param {boolean} [weak]
  * @return {string}
  * @private
  */
 
-function stattag (stat) {
-  var mtime = stat.mtime.getTime().toString(16)
-  var size = stat.size.toString(16)
+function stattag (stat, weak) {
+  var mtime = stat.mtime.getTime()
+  var size = stat.size
+  var ino = stat.ino
 
-  return '"' + size + '-' + mtime + '"'
+  // Create cache key using inode and mtime
+  var cacheKey = ino + '-' + mtime
+
+  // Check stat cache
+  var now = Date.now()
+  var cached = statCache.get(cacheKey)
+  if (cached && (now - cached.timestamp) < STAT_CACHE_TTL) {
+    return weak ? cached.weakTag : cached.strongTag
+  }
+
+  // Generate tags
+  var mtimeHex = mtime.toString(16)
+  var sizeHex = size.toString(16)
+  var tag = '"' + sizeHex + '-' + mtimeHex + '"'
+  var weakTag = 'W/' + tag
+
+  // Update cache
+  statCache.set(cacheKey, {
+    strongTag: tag,
+    weakTag: weakTag,
+    timestamp: now
+  })
+
+  // Clean old cache entries periodically
+  if (statCache.size > HASH_CACHE_SIZE) {
+    var keysToDelete = []
+    statCache.forEach(function (value, key) {
+      if ((now - value.timestamp) >= STAT_CACHE_TTL) {
+        keysToDelete.push(key)
+      }
+    })
+    keysToDelete.forEach(function (key) {
+      statCache.delete(key)
+    })
+  }
+
+  return weak ? weakTag : tag
 }
